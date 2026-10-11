@@ -1,0 +1,543 @@
+
+#include <LiquidCrystal.h>
+#include <EEPROM.h>
+
+// =====================================================
+// SMART PLANTER
+// Arduino Uno R3
+// =====================================================
+
+// LCD: RS, EN, D4, D5, D6, D7
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+
+// Connections
+const byte BUTTON_PIN = A0;
+const byte SOIL_PIN = A1;
+const byte RELAY_PIN = A2;
+const byte SOIL_POWER_PIN = 12;
+
+// Relay is active LOW
+const byte RELAY_ON = LOW;
+const byte RELAY_OFF = HIGH;
+
+// Fixed demonstration readings (not from DHT11)
+const byte AIR_TEMP = 21;
+const byte AIR_HUMIDITY = 53;
+
+// Soil calibration
+const int SOIL_DRY = 1009;
+const int SOIL_WET = 570;
+const byte MAX_MOISTURE = 90;
+
+// Timings
+const unsigned long SOIL_INTERVAL = 500UL;
+const unsigned long LCD_INTERVAL = 250UL;
+const unsigned long CLIMATE_INTERVAL = 4000UL;
+
+const unsigned long MANUAL_LIMIT = 5000UL;
+const unsigned long AUTO_BURST = 1000UL;
+const unsigned long SOAK_TIME = 15000UL;
+const unsigned long AUTO_LIMIT = 8000UL;
+
+// Wait after manual watering before auto can resume
+const unsigned long MANUAL_COOLDOWN = 60000UL;
+
+const unsigned long HOUR = 3600000UL;
+const unsigned long DAY = 24UL * HOUR;
+
+// =====================================================
+// PLANT PROFILES
+// =====================================================
+
+struct Plant {
+  const char* name;
+  byte startAt;
+  byte target;
+  unsigned long cooldown;
+};
+
+const Plant plants[] = {
+  {"Limba soacrei", 18, 30, 10UL * DAY},
+  {"Dracaena",      35, 55,  3UL * DAY},
+  {"Pothos",        35, 55,  2UL * DAY},
+  {"Monstera",      40, 60,  2UL * DAY},
+  {"Aloe vera",     15, 28,  7UL * DAY},
+  {"Peace Lily",    50, 70,  1UL * DAY},
+  {"Basil",         50, 70, 12UL * HOUR},
+  {"Rosemary",      25, 40,  4UL * DAY}
+};
+
+const byte PLANT_COUNT =
+  sizeof(plants) / sizeof(plants[0]);
+
+byte selectedPlant = 0;
+
+// =====================================================
+// SOIL SENSOR
+// =====================================================
+
+int soilRaw = 0;
+int soilPercent = 0;
+bool soilValid = false;
+
+unsigned long lastSoilRead = 0;
+
+// =====================================================
+// PUMP
+// =====================================================
+
+bool pumpRunning = false;
+bool manualLocked = false;
+
+unsigned long pumpStartedAt = 0;
+unsigned long lastManualWatering = 0;
+bool manualCooldownActive = false;
+
+unsigned long lastWateringAt = 0;
+bool hasWatered = false;
+
+// =====================================================
+// AUTOMATIC WATERING
+// =====================================================
+
+enum WaterState {
+  IDLE,
+  PUMPING,
+  SOAKING,
+  LOCKED
+};
+
+WaterState waterState = IDLE;
+
+unsigned long stateStartedAt = 0;
+unsigned long cyclePumpTime = 0;
+
+// =====================================================
+// BUTTONS
+// =====================================================
+
+enum Button {
+  NONE,
+  UP,
+  DOWN,
+  SELECT
+};
+
+Button lastReading = NONE;
+Button stableButton = NONE;
+
+unsigned long buttonChangedAt = 0;
+const unsigned long DEBOUNCE_MS = 50UL;
+
+// =====================================================
+// DISPLAY
+// =====================================================
+
+unsigned long lastLCDUpdate = 0;
+unsigned long lastClimateSwitch = 0;
+unsigned long plantMessageUntil = 0;
+
+bool showClimate = false;
+
+// =====================================================
+// PUMP CONTROL
+// =====================================================
+
+void setPump(bool enabled) {
+  if (enabled &&
+      (!soilValid || soilPercent >= MAX_MOISTURE)) {
+    enabled = false;
+  }
+
+  if (enabled && !pumpRunning) {
+    pumpStartedAt = millis();
+  }
+
+  pumpRunning = enabled;
+
+  digitalWrite(
+    RELAY_PIN,
+    enabled ? RELAY_ON : RELAY_OFF
+  );
+}
+
+void stopAuto() {
+  setPump(false);
+  waterState = IDLE;
+  cyclePumpTime = 0;
+}
+
+void finishAuto() {
+  stopAuto();
+
+  lastWateringAt = millis();
+  hasWatered = true;
+}
+
+// =====================================================
+// READ SOIL
+// =====================================================
+
+void readSoil() {
+  digitalWrite(SOIL_POWER_PIN, HIGH);
+  delay(100);
+
+  analogRead(SOIL_PIN);
+
+  long total = 0;
+
+  for (byte i = 0; i < 5; i++) {
+    total += analogRead(SOIL_PIN);
+    delay(5);
+  }
+
+  digitalWrite(SOIL_POWER_PIN, LOW);
+
+  soilRaw = total / 5;
+
+  // Basic fault detection
+  soilValid = soilRaw > 10 && soilRaw < 1020;
+
+  if (!soilValid) {
+    setPump(false);
+    waterState = LOCKED;
+    return;
+  }
+
+  soilPercent = map(
+    soilRaw,
+    SOIL_DRY,
+    SOIL_WET,
+    0,
+    100
+  );
+
+  soilPercent = constrain(soilPercent, 0, 100);
+
+  if (soilPercent >= MAX_MOISTURE) {
+    stopAuto();
+  }
+}
+
+// =====================================================
+// BUTTON READING
+// =====================================================
+
+Button readButton() {
+  int value = analogRead(BUTTON_PIN);
+
+  if (value >= 50 && value < 195) return UP;
+  if (value >= 195 && value < 380) return DOWN;
+  if (value >= 555 && value < 790) return SELECT;
+
+  return NONE;
+}
+
+void changePlant(int direction) {
+  selectedPlant =
+    (selectedPlant + PLANT_COUNT + direction)
+    % PLANT_COUNT;
+
+  EEPROM.update(0, selectedPlant);
+
+  stopAuto();
+  hasWatered = false;
+
+  // Give the soil time to settle before watering
+  lastManualWatering = millis();
+  manualCooldownActive = true;
+
+  plantMessageUntil = millis() + 1800UL;
+}
+
+void updateButtons() {
+  Button reading = readButton();
+  unsigned long now = millis();
+
+  if (reading != lastReading) {
+    lastReading = reading;
+    buttonChangedAt = now;
+  }
+
+  if (now - buttonChangedAt >= DEBOUNCE_MS &&
+      reading != stableButton) {
+
+    Button previous = stableButton;
+    stableButton = reading;
+
+    if (stableButton == UP) {
+      changePlant(-1);
+    }
+
+    if (stableButton == DOWN) {
+      changePlant(1);
+    }
+
+    if (stableButton == SELECT) {
+      manualLocked = false;
+      stopAuto();
+    }
+
+    // SELECT released
+    if (previous == SELECT &&
+        stableButton != SELECT) {
+
+      setPump(false);
+
+      lastManualWatering = millis();
+      manualCooldownActive = true;
+
+      // Manual watering counts as a watering event.
+      lastWateringAt = millis();
+      hasWatered = true;
+    }
+
+    if (stableButton == NONE) {
+      manualLocked = false;
+    }
+  }
+}
+
+// =====================================================
+// MANUAL WATERING
+// =====================================================
+
+void updateManual() {
+  if (stableButton != SELECT) return;
+
+  if (manualLocked || !soilValid ||
+      soilPercent >= MAX_MOISTURE) {
+    setPump(false);
+    return;
+  }
+
+  if (!pumpRunning) {
+    setPump(true);
+  }
+
+  if (millis() - pumpStartedAt >= MANUAL_LIMIT) {
+    setPump(false);
+    manualLocked = true;
+  }
+}
+
+// =====================================================
+// AUTOMATIC WATERING
+// =====================================================
+
+bool cooldownComplete() {
+  if (!hasWatered) return true;
+
+  return millis() - lastWateringAt >=
+         plants[selectedPlant].cooldown;
+}
+
+void updateAuto() {
+  if (stableButton == SELECT) return;
+  if (!soilValid || waterState == LOCKED) return;
+
+  unsigned long now = millis();
+  const Plant &plant = plants[selectedPlant];
+
+  // Cooldown after manual watering or plant change
+  if (manualCooldownActive) {
+    if (now - lastManualWatering < MANUAL_COOLDOWN) {
+      return;
+    }
+    manualCooldownActive = false;
+  }
+
+  if (soilPercent >= MAX_MOISTURE) {
+    stopAuto();
+    return;
+  }
+
+  if (waterState == IDLE) {
+    if (soilPercent < plant.startAt &&
+        cooldownComplete()) {
+
+      cyclePumpTime = 0;
+      waterState = PUMPING;
+      setPump(true);
+    }
+  }
+
+  else if (waterState == PUMPING) {
+    if (soilPercent >= plant.target) {
+      finishAuto();
+      return;
+    }
+
+    if (now - pumpStartedAt >= AUTO_BURST) {
+      cyclePumpTime += now - pumpStartedAt;
+      setPump(false);
+
+      if (cyclePumpTime >= AUTO_LIMIT) {
+        waterState = LOCKED;
+      } else {
+        waterState = SOAKING;
+        stateStartedAt = now;
+      }
+    }
+  }
+
+  else if (waterState == SOAKING) {
+    if (soilPercent >= plant.target) {
+      finishAuto();
+      return;
+    }
+
+    if (now - stateStartedAt >= SOAK_TIME) {
+      waterState = PUMPING;
+      setPump(true);
+    }
+  }
+}
+
+// =====================================================
+// LCD HELPERS
+// =====================================================
+
+void printLine(byte row, const char* text) {
+  lcd.setCursor(0, row);
+  lcd.print("                ");
+  lcd.setCursor(0, row);
+  lcd.print(text);
+}
+
+// =====================================================
+// UPDATE LCD
+// =====================================================
+
+void updateLCD() {
+  char text[17];
+  unsigned long now = millis();
+
+  if ((long)(plantMessageUntil - now) > 0) {
+    printLine(0, "PLANT SELECTED");
+    printLine(1, plants[selectedPlant].name);
+    return;
+  }
+
+  // Show number + plant name
+  snprintf(
+    text,
+    sizeof(text),
+    "%d.%s",
+    selectedPlant + 1,
+    plants[selectedPlant].name
+  );
+
+  printLine(0, text);
+
+  if (pumpRunning) {
+    printLine(1, "WATERING...");
+    return;
+  }
+
+  if (manualLocked && stableButton == SELECT) {
+    printLine(1, "PUMP LIMIT 5 SEC");
+    return;
+  }
+
+  if (!soilValid) {
+    printLine(1, "SOIL SENSOR ERR");
+    return;
+  }
+
+  if (waterState == LOCKED) {
+    printLine(1, "WATERING LOCKED");
+    return;
+  }
+
+  if (showClimate) {
+    snprintf(
+      text,
+      sizeof(text),
+      "T:%dC Air:%d%%",
+      AIR_TEMP,
+      AIR_HUMIDITY
+    );
+  } else {
+    snprintf(
+      text,
+      sizeof(text),
+      "Soil:%d%% AUTO",
+      soilPercent
+    );
+  }
+
+  printLine(1, text);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+  // Relay OFF before configuring output
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  digitalWrite(SOIL_POWER_PIN, LOW);
+  pinMode(SOIL_POWER_PIN, OUTPUT);
+
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(SOIL_PIN, INPUT);
+
+  lcd.begin(16, 2);
+
+  byte saved = EEPROM.read(0);
+
+  if (saved < PLANT_COUNT) {
+    selectedPlant = saved;
+  }
+
+  printLine(0, "SMART PLANTER");
+  printLine(1, "Starting...");
+
+  delay(1000);
+
+  readSoil();
+
+  lastSoilRead = millis();
+  lastClimateSwitch = millis();
+
+  // Prevent immediate automatic watering at startup
+  lastManualWatering = millis();
+  manualCooldownActive = true;
+
+  updateLCD();
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  updateButtons();
+
+  if (now - lastSoilRead >= SOIL_INTERVAL) {
+    lastSoilRead = now;
+    readSoil();
+  }
+
+  // Manual control takes priority.
+  if (stableButton == SELECT) {
+    updateManual();
+  } else {
+    updateAuto();
+  }
+
+  if (now - lastClimateSwitch >= CLIMATE_INTERVAL) {
+    lastClimateSwitch = now;
+    showClimate = !showClimate;
+  }
+
+  if (now - lastLCDUpdate >= LCD_INTERVAL) {
+    lastLCDUpdate = now;
+    updateLCD();
+  }
+}
