@@ -1,0 +1,1843 @@
+// SPDX-License-Identifier: MIT
+// Picurici 1.0 - Smart Planter  (https://github.com/Artful-DevA/NEXTLAB.TECH-2026-Robotica-creativa-Picurici-1.0)
+/*
+  Picurici - Smart Planter firmware
+  Board:   Arduino Uno R3
+  Display: Heltec 1.54" 128x64 I2C OLED, SSD1309 controller (SDA=A4, SCL=A5, VCC=5V)
+  Input:   KY-040 rotary encoder with push button
+  Pump:    relay module on D7 (active LOW, see RELAY_ACTIVE_LOW)
+  Soil:    analog moisture sensor on A0, powered from D12
+  Air:     DHT11 or DHT22 temperature/humidity sensor, data on A1 (auto-detected)
+  Tank:    HW-038 water level sensor, signal on A2, powered from D8
+
+  Libraries: U8g2 (install via Library Manager). Wire and EEPROM ship with the IDE.
+
+  Controls
+  - Turn:   move the highlight.   Click: select.
+  - HOLD the button (on Home or the Watering screen) to water by hand.
+    The pump runs while you hold, up to MANUAL_MAX_MS, and stops when you let go.
+  - Menu > Watering > "Auto water" turns automatic watering on/off.
+    Auto watering needs the real soil sensor (USE_REAL_SOIL_SENSOR 1).
+  - Menu > Watering > Calibrate: sensor in air, click; in water, click.
+  - Menu > Language: English / Romana / Francais.
+    The two readings are saved and used to turn raw values into 0..100 %.
+
+  Design notes
+  - The encoder AND the button are read by a pin-change interrupt (PCINT2,
+    covers D0-D7), so nothing is missed while the OLED is being redrawn.
+  - Events (turn / click / hold start / hold end) go into a queue in the order
+    they happened; the main loop handles them one by one.
+  - Pump safety: every run has a hard time limit, auto watering waters in short
+    pulses with a soak pause, gives up after AUTO_MAX_PULSES pulses without the
+    soil getting wet enough, and never runs on demo readings. The watchdog
+    reboots the board if the loop ever stalls; the relay is OFF after any reset.
+  - I2C errors to the display are detected and the frame is redrawn.
+
+  If turning/clicking is wrong, change ONLY the three pin numbers below
+  (and ENC_REVERSE if left/right are swapped). Open Serial Monitor at
+  115200 baud to see every event the firmware receives.
+*/
+
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <EEPROM.h>
+#include <avr/wdt.h>
+
+// ===================== CONFIGURATION =====================
+
+// Encoder pins - must be D2..D7. Default = the mapping that worked in the
+// last diagnostic (CLK on D4, DT on D3, SW on D2).
+constexpr uint8_t PIN_ENC_CLK = 4;
+constexpr uint8_t PIN_ENC_DT  = 3;
+constexpr uint8_t PIN_ENC_SW  = 2;
+
+constexpr bool ENC_REVERSE   = false;  // true = swap left/right
+constexpr bool ENC_HALF_STEP = false;  // true if one detent = half a quadrature cycle
+                                       // (symptom: you must turn 2 clicks per step)
+
+constexpr uint8_t  BTN_STABLE_MS    = 15;   // button must be released this long before a press counts
+constexpr uint8_t  BTN_LOCKOUT_MS   = 150;  // minimum time between two accepted clicks
+constexpr uint8_t  BTN_BOUNCE_MS    = 30;   // contact chatter right after a press is ignored
+constexpr uint16_t BTN_HOLD_MS      = 700;  // press this long = hold (manual watering)
+
+constexpr uint8_t PIN_SOIL_ADC = A0;
+constexpr uint8_t PIN_SOIL_PWR = 12;
+constexpr uint8_t PIN_DHT      = A1;     // DHT11 / DHT22 data pin
+constexpr uint8_t PIN_TANK_ADC = A2;     // HW-038 signal
+constexpr uint8_t PIN_TANK_PWR = 8;      // HW-038 power (on only while reading, slows corrosion)
+constexpr int     TANK_EMPTY_RAW = 300;  // default "1 cm left" reading; set yours with Watering > Tank > Set 1cm
+constexpr int     TANK_HYST      = 40;   // must rise this much above the empty level to count as refilled
+constexpr int     TANK_FULL_RAW  = 630;  // sensor wet up to the top of its traces
+constexpr uint8_t PIN_RELAY    = 7;      // D7
+
+// Relay modules come in two kinds. If the pump runs when it should be off
+// (or never runs), flip this.
+//   true  = active LOW:  D7 LOW  switches the pump ON  (your module)
+//   false = active HIGH: D7 HIGH switches the pump ON
+constexpr bool RELAY_ACTIVE_LOW = true;
+constexpr uint8_t RELAY_ON  = RELAY_ACTIVE_LOW ? LOW : HIGH;
+constexpr uint8_t RELAY_OFF = RELAY_ACTIVE_LOW ? HIGH : LOW;
+
+// Active-LOW modules: for OFF the pin is released (input, not driven) so the
+// module's own pull-up holds IN at the module's voltage. Driving 5V HIGH
+// leaves a dim glow on the module LED when its supply is a bit higher.
+
+#define PUMP_ENABLED         1           // 0 = relay is never switched on (pump locked off)
+#define USE_REAL_SOIL_SENSOR 1           // 1 = read soil sensor on A0 (needed for auto watering)
+#define USE_DHT_SENSOR       1           // 1 = read DHT11/DHT22 on A1, 0 = demo values
+#define USE_TANK_SENSOR      1           // 1 = HW-038 in the water tank (can also be switched off on the device)
+#define SERIAL_DEBUG         0           // 1 = print events to Serial Monitor (115200)
+#define DISPLAY_SSD1309      1           // 1 = SSD1309 controller (Heltec/Waveshare 1.54")
+                                         // 0 = SH1106 controller (typical 1.3" modules)
+
+// Watering limits
+constexpr uint32_t MANUAL_MAX_MS   = 15000;   // longest hand-watering run, even if still held
+constexpr uint32_t MANUAL_PULSE_MS = 3000;    // "Water now" click in the Watering menu
+constexpr uint32_t AUTO_PULSE_MS   = 3000;    // one automatic watering pulse
+constexpr uint32_t AUTO_SOAK_MS    = 60000;   // wait after any watering before auto waters again
+constexpr uint8_t  AUTO_MAX_PULSES = 6;       // pulses in a row without reaching target -> stop + warn
+
+constexpr uint16_t DISPLAY_REFRESH_MS = 1000;  // periodic repaint: wipes out any I2C glitch
+constexpr uint16_t SOIL_READ_MS       = 5000;  // soil sensor reading interval
+
+// Default calibration, used until you run Menu > Calibrate
+constexpr int SOIL_DRY_DEFAULT = 1009;   // sensor in dry air
+constexpr int SOIL_WET_DEFAULT = 570;    // sensor in water
+constexpr int SOIL_CAL_MIN_SPAN = 100;   // dry and wet must differ at least this much
+
+// Sensitivity on top of the calibration (Soil details screen). Boosts the
+// middle of the range so damp soil reads wetter; 0% and 100% stay put.
+const uint8_t SENS_BOOST[]  = { 0, 35, 70, 100 };
+constexpr uint8_t SENS_DEFAULT = 1;      // Low
+
+// ==========================================================
+
+static_assert(PIN_ENC_CLK >= 2 && PIN_ENC_CLK <= 7, "Encoder pins must be D2..D7");
+static_assert(PIN_ENC_DT  >= 2 && PIN_ENC_DT  <= 7, "Encoder pins must be D2..D7");
+static_assert(PIN_ENC_SW  >= 2 && PIN_ENC_SW  <= 7, "Encoder pins must be D2..D7");
+static_assert(PIN_ENC_CLK != PIN_ENC_DT && PIN_ENC_CLK != PIN_ENC_SW && PIN_ENC_DT != PIN_ENC_SW,
+              "Encoder pins must be different");
+
+
+#define FONT_MAIN  u8g2_font_6x10_tr
+#define FONT_SMALL u8g2_font_5x7_tr
+#define FONT_BIG   u8g2_font_logisoso16_tn   // digits only
+
+// ---------- Icons (XBM, LSB first) ----------
+const uint8_t ICON_PLANT[] PROGMEM = { 0x80, 0x01, 0xC0, 0x03, 0xCC, 0x33, 0x9E, 0x79, 0xBE, 0x7D, 0xBC, 0x3D, 0xB8, 0x1D, 0xA0, 0x05, 0x80, 0x01, 0xFE, 0x7F, 0xFE, 0x7F, 0xFC, 0x3F, 0xF8, 0x1F, 0xF8, 0x1F, 0xF0, 0x0F, 0xE0, 0x07 };
+const uint8_t ICON_DROP[] PROGMEM = { 0x08, 0x08, 0x1C, 0x1C, 0x3E, 0x3E, 0x7F, 0x7F, 0x7F, 0x3E, 0x1C };
+const uint8_t ICON_THERMO[] PROGMEM = { 0x0E, 0x0A, 0x0A, 0x0A, 0x0E, 0x0E, 0x1F, 0x1F, 0x0E };
+
+// ---------- Data ----------
+// Plant database (in flash to save RAM). Names without diacritics: the
+// display font is plain ASCII. target = auto watering starts below this %.
+struct Plant { char name[17]; uint8_t target; };
+const Plant PLANTS[] PROGMEM = {
+  { "Limba soacrei",    20 },   // Sansevieria
+  { "Dracaena",         30 },
+  { "Muscata",          30 },   // Pelargonium
+  { "Ficus",            35 },
+  { "Craciunita",       40 },   // Schlumbergera
+  { "Orhidee",          30 },   // Phalaenopsis
+  { "Spatifilum",       50 },   // Spathiphyllum
+  { "Violeta africana", 45 },   // Saintpaulia
+  { "Planta banilor",   15 },   // Crassula ovata
+  { "Aloe vera",        15 },
+  { "Zamioculcas",      20 },
+  { "Iedera",           45 },   // Hedera
+  { "Feriga",           55 },   // Nephrolepis
+  { "Begonie",          45 },
+  { "Potos",            35 },   // Epipremnum
+  { "Cactus",           10 },
+};
+constexpr uint8_t PLANT_COUNT = sizeof(PLANTS) / sizeof(PLANTS[0]);
+
+// ---------- Languages ----------
+// All on-screen text, one flash block per language (strings separated by \0,
+// in TextId order). Plain ASCII: the display font has no diacritics.
+enum Lang : uint8_t { LANG_EN, LANG_RO, LANG_FR, LANG_COUNT };
+const char LANG_NAMES[][9] = { "English", "Romana", "Francais" };   // shown in their own language
+
+enum TextId : uint8_t {
+  T_MENU, T_PLANTS, T_SOIL, T_ENV, T_WATER, T_LANG,
+  T_CAL1, T_CAL2, T_CAL_DONE, T_CAL, T_DEMO, M_PLANT,
+  M_SOIL, M_WATER, M_ENV, M_LANG, M_BACK, W_AUTO,
+  W_NOW, W_BELOW, W_CAL, V_ON, V_OFF, V_NA,
+  V_CHECK, V_LOCKED, V_NONE, H_MENU, H_FAULT, H_NOSENSOR,
+  H_AUTO, H_HOLD, F_MIN, S_OK, S_DRY, S_WET,
+  S_ERR, L_MOIST, L_WATERED, L_NEVER, AGO_PRE, AGO_SUF,
+  F_RAW, F_CAL, B_BACK, F_SENS, SENS_OFF, SENS_LOW,
+  SENS_MED, SENS_HIGH, L_TEMP, L_HUM, L_SENSOR, L_SIMULATED,
+  C_DRY_AIR, C_IN_WATER, C_READING, C_NOSIGNAL, C_WAIT, F_DRYSAVED,
+  B_NEXT, B_SAVE, B_CANCEL, C_SAVED, C_DRY, C_WET,
+  B_OK, C_NOTSAVED, C_FAIL1, C_FAIL2, B_RETRY, SC_WATERING,
+  SC_AUTO, SC_MAX, SC_LETGO, SC_TAPSTOP, W_TANK, V_EMPTY,
+  H_REFILL, T_TANK, TK_LEVEL, TK_SET,
+  TEXT_COUNT
+};
+
+const char TEXT_EN[] PROGMEM =
+  "MENU\0"
+  "SELECT PLANT\0"
+  "SOIL\0"
+  "ENVIRONMENT\0"
+  "WATERING\0"
+  "LANGUAGE\0"
+  "CALIBRATE 1/2\0"
+  "CALIBRATE 2/2\0"
+  "CALIBRATED\0"
+  "CALIBRATE\0"
+  "DEMO\0"
+  "Select plant\0"
+  "Soil\0"
+  "Watering\0"
+  "Environment\0"
+  "Language\0"
+  "Back\0"
+  "Auto water\0"
+  "Water now\0"
+  "Water below\0"
+  "Calibrate\0"
+  "On\0"
+  "Off\0"
+  "N/A\0"
+  "CHECK\0"
+  "locked\0"
+  "none\0"
+  "MENU >\0"
+  "!CHECK\0"
+  "!SENSOR\0"
+  "AUTO\0"
+  "hold=H2O\0"
+  "min %u%%\0"
+  "OK\0"
+  "Dry\0"
+  "Wet\0"
+  "Error\0"
+  "Moisture\0"
+  "Watered\0"
+  "never\0"
+  "\0"
+  " ago\0"
+  "raw %d\0"
+  "dry %d wet %d\0"
+  "< Back\0"
+  "Sens: %s\0"
+  "Off\0"
+  "Low\0"
+  "Med\0"
+  "High\0"
+  "Temperature\0"
+  "Humidity\0"
+  "Sensor\0"
+  "Simulated values\0"
+  "Sensor in DRY air\0"
+  "Sensor in WATER\0"
+  "Reading\0"
+  "no signal\0"
+  "Wait until it settles\0"
+  "Dry saved: %d\0"
+  "Next\0"
+  "Save\0"
+  "Cancel\0"
+  "Saved!\0"
+  "Dry\0"
+  "Wet\0"
+  "OK\0"
+  "Not saved:\0"
+  "Dry and wet readings are\0"
+  "too close. Check wiring.\0"
+  "Retry\0"
+  "Watering\0"
+  "Auto watering\0"
+  "max!\0"
+  "let go\0"
+  "tap=stop\0"
+  "Tank\0"
+  "EMPTY\0"
+  "!REFILL\0"
+  "TANK\0"
+  "Level\0"
+  "Set 1cm\0";
+
+const char TEXT_RO[] PROGMEM =
+  "MENIU\0"
+  "ALEGE PLANTA\0"
+  "SOL\0"
+  "MEDIU\0"
+  "UDARE\0"
+  "LIMBA\0"
+  "CALIBRARE 1/2\0"
+  "CALIBRARE 2/2\0"
+  "CALIBRAT\0"
+  "CALIBRARE\0"
+  "DEMO\0"
+  "Alege planta\0"
+  "Sol\0"
+  "Udare\0"
+  "Mediu\0"
+  "Limba\0"
+  "Inapoi\0"
+  "Udare auto\0"
+  "Uda acum\0"
+  "Prag udare\0"
+  "Calibrare\0"
+  "Da\0"
+  "Nu\0"
+  "N/A\0"
+  "VERIF\0"
+  "blocat\0"
+  "niciunul\0"
+  "MENIU>\0"
+  "!VERIF\0"
+  "!SENZOR\0"
+  "AUTO\0"
+  "tine=H2O\0"
+  "min %u%%\0"
+  "OK\0"
+  "Uscat\0"
+  "Ud\0"
+  "Eroare\0"
+  "Umiditate\0"
+  "Udat\0"
+  "niciodata\0"
+  "acum \0"
+  "\0"
+  "brut %d\0"
+  "usc %d ud %d\0"
+  "< Inapoi\0"
+  "Sens: %s\0"
+  "Oprit\0"
+  "Mic\0"
+  "Mediu\0"
+  "Mare\0"
+  "Temperatura\0"
+  "Umiditate\0"
+  "Senzor\0"
+  "Valori simulate\0"
+  "Senzor in aer USCAT\0"
+  "Senzor in APA\0"
+  "Citire\0"
+  "fara semnal\0"
+  "Asteapta stabilizarea\0"
+  "Uscat salvat: %d\0"
+  "Inainte\0"
+  "Salveaza\0"
+  "Anuleaza\0"
+  "Salvat!\0"
+  "Uscat\0"
+  "Ud\0"
+  "OK\0"
+  "Nesalvat:\0"
+  "Valorile uscat si ud sunt\0"
+  "prea apropiate. Verifica.\0"
+  "Reincearca\0"
+  "Udare\0"
+  "Udare automata\0"
+  "max!\0"
+  "lasa\0"
+  "clic=stop\0"
+  "Rezervor\0"
+  "GOL\0"
+  "!UMPLE\0"
+  "REZERVOR\0"
+  "Nivel\0"
+  "Seteaza 1cm\0";
+
+const char TEXT_FR[] PROGMEM =
+  "MENU\0"
+  "CHOIX PLANTE\0"
+  "SOL\0"
+  "AMBIANCE\0"
+  "ARROSAGE\0"
+  "LANGUE\0"
+  "CALIBRER 1/2\0"
+  "CALIBRER 2/2\0"
+  "CALIBRE\0"
+  "CALIBRER\0"
+  "DEMO\0"
+  "Choisir plante\0"
+  "Sol\0"
+  "Arrosage\0"
+  "Ambiance\0"
+  "Langue\0"
+  "Retour\0"
+  "Mode auto\0"
+  "Arroser\0"
+  "Seuil\0"
+  "Calibrer\0"
+  "Oui\0"
+  "Non\0"
+  "N/A\0"
+  "VERIF\0"
+  "bloque\0"
+  "aucun\0"
+  "MENU >\0"
+  "!VERIF\0"
+  "!CAPTEUR\0"
+  "AUTO\0"
+  "appui=H2O\0"
+  "min %u%%\0"
+  "OK\0"
+  "Sec\0"
+  "Humide\0"
+  "Erreur\0"
+  "Humidite\0"
+  "Arrose\0"
+  "jamais\0"
+  "il y a \0"
+  "\0"
+  "brut %d\0"
+  "sec %d hum %d\0"
+  "< Retour\0"
+  "Sens: %s\0"
+  "Non\0"
+  "Bas\0"
+  "Moyen\0"
+  "Haut\0"
+  "Temperature\0"
+  "Humidite\0"
+  "Capteur\0"
+  "Valeurs simulees\0"
+  "Capteur a l'air SEC\0"
+  "Capteur dans l'EAU\0"
+  "Mesure\0"
+  "pas de signal\0"
+  "Attendre la stabilite\0"
+  "Sec enregistre: %d\0"
+  "Suivant\0"
+  "Valider\0"
+  "Annuler\0"
+  "Enregistre!\0"
+  "Sec\0"
+  "Humide\0"
+  "OK\0"
+  "Non enregistre:\0"
+  "Valeurs sec et humide\0"
+  "trop proches. Verifiez.\0"
+  "Reessayer\0"
+  "Arrosage\0"
+  "Arrosage auto\0"
+  "max!\0"
+  "relacher\0"
+  "clic=stop\0"
+  "Reservoir\0"
+  "VIDE\0"
+  "!REMPLIR\0"
+  "RESERVOIR\0"
+  "Niveau\0"
+  "Regler 1cm\0";
+
+const char* const TEXT_BLOCKS[LANG_COUNT] = { TEXT_EN, TEXT_RO, TEXT_FR };
+
+enum : uint8_t { MI_PLANT, MI_SOIL, MI_WATER, MI_ENV, MI_LANG, MI_BACK, MENU_COUNT };
+const uint8_t MENU_TEXT[MENU_COUNT] = { M_PLANT, M_SOIL, M_WATER, M_ENV, M_LANG, M_BACK };
+
+enum : uint8_t { WI_AUTO, WI_NOW, WI_TARGET, WI_TANK, WI_CAL, WI_BACK, WATER_COUNT };
+
+// Readings (soil is demo unless USE_REAL_SOIL_SENSOR)
+uint8_t soilMoisturePct = 42;
+int     soilDry = SOIL_DRY_DEFAULT;       // calibration (saved in EEPROM)
+int     soilWet = SOIL_WET_DEFAULT;
+int     soilRaw = 0;
+bool    soilOk  = true;                 // false = reading looks like a disconnected sensor
+// Air readings in tenths (214 = 21.4). Demo values until the DHT answers.
+int16_t  airTemp10 = 210;
+uint16_t airHum10  = 530;
+bool     airOk     = !USE_DHT_SENSOR;   // false = no valid reading yet / sensor lost
+int      tankRaw   = TANK_FULL_RAW;     // water level sensor reading
+bool     tankEmpty = false;             // true = auto watering paused until refilled (manual still works)
+bool     tankOn    = USE_TANK_SENSOR;   // switched in Watering > Tank (saved)
+int      tankEmptyRaw = TANK_EMPTY_RAW; // reading at ~1 cm of water (saved)
+uint32_t tankSavedMs = 0;               // shows "OK" briefly after Set 1cm
+uint8_t  dhtType   = 0;                 // 11 or 22 once detected
+
+// EEPROM layout
+constexpr int     EE_MAGIC_ADDR = 0;
+constexpr int     EE_PLANT_ADDR = 1;
+constexpr int     EE_AUTO_ADDR  = 2;
+constexpr int     EE_CAL_MAGIC_ADDR = 3;     // calibration has its own marker
+constexpr int     EE_CAL_DRY_ADDR   = 4;     // int, 2 bytes
+constexpr int     EE_CAL_WET_ADDR   = 6;     // int, 2 bytes
+constexpr uint8_t EE_CAL_MAGIC      = 0x5C;
+constexpr int     EE_SENS_ADDR      = 8;
+constexpr int     EE_LANG_ADDR      = 9;
+constexpr int     EE_TANK_ON_ADDR   = 10;
+constexpr int     EE_TANK_RAW_ADDR  = 11;    // int, 2 bytes
+constexpr uint8_t EE_MAGIC      = 0xA6;   // changed when the plant list changed
+
+// ---------- UI state ----------
+enum Screen : uint8_t { SCR_HOME, SCR_MENU, SCR_PLANTS, SCR_SOIL, SCR_ENV, SCR_WATER, SCR_CAL, SCR_LANG, SCR_TANK };
+enum HomeFocus : uint8_t { FOCUS_PLANT, FOCUS_MENU };
+
+Screen   screen        = SCR_HOME;
+uint8_t  homeFocus     = FOCUS_PLANT;
+uint8_t  menuCursor    = 0;
+uint8_t  menuTop       = 0;      // first visible row in the menu list
+uint8_t  plantCursor   = 0;      // 0..PLANT_COUNT-1 = plants, PLANT_COUNT = "Back"
+uint8_t  plantTop      = 0;      // first visible row in the plant list
+uint8_t  waterCursor   = 0;
+uint8_t  waterTop      = 0;
+uint8_t  langCursor    = 0;
+uint8_t  tankCursor    = 0;      // Tank screen: 0 sensor on/off, 1 level, 2 set 1cm, 3 back
+uint8_t  lang          = LANG_EN;        // saved in EEPROM
+
+// Calibration screen
+enum : uint8_t { CAL_DRY, CAL_WET, CAL_DONE, CAL_FAIL };
+uint8_t  calStep       = CAL_DRY;
+uint8_t  calChoice     = 0;      // 0 = Save, 1 = Cancel
+int      calDryTmp     = 0;
+
+uint8_t  soilSens      = SENS_DEFAULT;   // index into SENS_BOOST (saved in EEPROM)
+uint8_t  soilCursor    = 0;              // Soil details: 0 = Back, 1 = Sensitivity
+uint8_t  selectedPlant = 0;
+bool     dirty         = true;
+
+// List layout: title on top, then LIST_ROWS rows of LIST_ROW_H pixels
+constexpr uint8_t LIST_Y0    = 12;
+constexpr uint8_t LIST_ROW_H = 13;
+constexpr uint8_t LIST_ROWS  = 4;
+
+// ---------- Pump / watering state ----------
+enum PumpMode : uint8_t { PUMP_IDLE, PUMP_HOLD, PUMP_TIMED };
+
+uint8_t  pumpMode      = PUMP_IDLE;
+bool     pumpIsAuto    = false;   // current run was started by auto watering
+uint32_t pumpStartMs   = 0;
+uint32_t pumpLimitMs   = 0;
+bool     holdActive    = false;   // button is being held for watering
+bool     holdMaxed     = false;   // hand-watering hit MANUAL_MAX_MS while still held
+bool     wateredOnce   = false;
+uint32_t lastWaterMs   = 0;
+
+bool     autoWater     = false;   // saved in EEPROM
+bool     autoFault     = false;   // too many pulses without reaching target
+uint8_t  autoPulses    = 0;       // pulses since moisture was last at/above target
+
+// ---------- Display driver with I2C error detection ----------
+// Same as U8g2's stock hardware-I2C byte driver, except that it records when
+// the display does not acknowledge a transfer. Stock U8g2 ignores that, and a
+// lost chunk makes the rest of a pixel row land in the wrong columns.
+volatile bool i2cError = false;
+uint16_t      i2cErrorCount = 0;
+
+static uint8_t u8x8_byte_hw_i2c_checked(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
+  switch (msg) {
+    case U8X8_MSG_BYTE_SEND:
+      Wire.write((uint8_t *)arg_ptr, (int)arg_int);
+      break;
+    case U8X8_MSG_BYTE_INIT:
+      if (u8x8->bus_clock == 0)
+        u8x8->bus_clock = u8x8->display_info->i2c_bus_clock_100kHz * 100000UL;
+      Wire.begin();
+      break;
+    case U8X8_MSG_BYTE_SET_DC:
+      break;
+    case U8X8_MSG_BYTE_START_TRANSFER:
+      Wire.setClock(u8x8->bus_clock);
+      Wire.beginTransmission(u8x8_GetI2CAddress(u8x8) >> 1);
+      break;
+    case U8X8_MSG_BYTE_END_TRANSFER:
+      if (Wire.endTransmission() != 0) i2cError = true;
+      break;
+    default:
+      return 0;
+  }
+  return 1;
+}
+
+class OledChecked : public U8G2 {
+ public:
+  OledChecked() : U8G2() {
+#if DISPLAY_SSD1309
+    u8g2_Setup_ssd1309_i2c_128x64_noname0_1(&u8g2, U8G2_R0, u8x8_byte_hw_i2c_checked, u8x8_gpio_and_delay_arduino);
+#else
+    u8g2_Setup_sh1106_i2c_128x64_noname_1(&u8g2, U8G2_R0, u8x8_byte_hw_i2c_checked, u8x8_gpio_and_delay_arduino);
+#endif
+    u8x8_SetPin_HW_I2C(getU8x8(), U8X8_PIN_NONE, U8X8_PIN_NONE, U8X8_PIN_NONE);
+  }
+};
+
+OledChecked oled;
+
+// ---------- Input events (filled by ISR) ----------
+enum : uint8_t { EV_RIGHT = 1, EV_LEFT, EV_CLICK, EV_HOLD_START, EV_HOLD_END };
+
+volatile uint8_t evBuf[16];
+volatile uint8_t evHead = 0, evTail = 0;
+
+volatile uint8_t  encPrev   = 0;
+volatile int8_t   encAccum  = 0;
+volatile uint8_t  swPrev    = 1;
+volatile uint32_t swLastChange = 0;
+volatile uint32_t lastClickMs  = 0;
+volatile bool     btnDown      = false;  // a press is in progress
+volatile bool     btnHoldFired = false;  // ... and it has turned into a hold
+volatile uint32_t btnDownMs    = 0;
+
+static inline void pushEvent(uint8_t e) {
+  uint8_t next = (evHead + 1) & 15;
+  if (next != evTail) {          // drop event if queue is full
+    evBuf[evHead] = e;
+    evHead = next;
+  }
+}
+
+bool popEvent(uint8_t &e) {
+  bool ok = false;
+  noInterrupts();
+  if (evTail != evHead) {
+    e = evBuf[evTail];
+    evTail = (evTail + 1) & 15;
+    ok = true;
+  }
+  interrupts();
+  return ok;
+}
+
+static inline uint8_t readEncAB(uint8_t pins) {
+  return (((pins >> PIN_ENC_CLK) & 1) << 1) | ((pins >> PIN_ENC_DT) & 1);
+}
+
+// Fires on any change of CLK, DT or SW.
+ISR(PCINT2_vect) {
+  uint8_t pins = PIND;
+
+  // --- Encoder: quadrature transition table + resync at the detent ---
+  static const int8_t QDEC[16] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
+  uint8_t ab = readEncAB(pins);
+  if (ab != encPrev) {
+    encAccum += QDEC[(encPrev << 2) | ab];
+    encPrev = ab;
+    if (ab == 0b11 || (ENC_HALF_STEP && ab == 0b00)) {   // resting position
+      if (encAccum >= 2)       pushEvent(ENC_REVERSE ? EV_LEFT : EV_RIGHT);
+      else if (encAccum <= -2) pushEvent(ENC_REVERSE ? EV_RIGHT : EV_LEFT);
+      encAccum = 0;    // contact bounce (+1/-1 pairs) never reaches the threshold
+    }
+  }
+
+  // --- Button ---
+  // A falling edge after a stable released period starts a press. Edges in
+  // the first BTN_BOUNCE_MS are contact chatter and are ignored (the press is
+  // kept). The release after that becomes a CLICK, or HOLD_END if pollButton()
+  // already turned the press into a hold. A noise spike (line goes back high
+  // and stays high) is dropped by pollButton() without a click.
+  uint8_t sw = (pins >> PIN_ENC_SW) & 1;
+  if (sw != swPrev) {
+    uint32_t now = millis();
+    if (sw == 0) {
+      if (!btnDown &&
+          (now - swLastChange) >= BTN_STABLE_MS &&
+          (now - lastClickMs) >= BTN_LOCKOUT_MS) {
+        btnDown = true;
+        btnHoldFired = false;
+        btnDownMs = now;
+      }
+    } else if (btnDown && (now - btnDownMs) >= BTN_BOUNCE_MS) {
+      if (btnHoldFired) {
+        pushEvent(EV_HOLD_END);
+      } else {
+        pushEvent(EV_CLICK);
+        lastClickMs = now;
+      }
+      btnDown = false;
+    }
+    swLastChange = now;
+    swPrev = sw;
+  }
+}
+
+void setupEncoder() {
+  pinMode(PIN_ENC_CLK, INPUT_PULLUP);
+  pinMode(PIN_ENC_DT,  INPUT_PULLUP);
+  pinMode(PIN_ENC_SW,  INPUT_PULLUP);
+  delay(5);
+
+  uint8_t pins = PIND;
+  encPrev = readEncAB(pins);
+  swPrev  = (pins >> PIN_ENC_SW) & 1;
+  swLastChange = millis();
+
+  PCMSK2 |= _BV(PIN_ENC_CLK) | _BV(PIN_ENC_DT) | _BV(PIN_ENC_SW);
+  PCIFR  |= _BV(PCIF2);   // clear any pending flag
+  PCICR  |= _BV(PCIE2);
+}
+
+// Hold is only used on screens where it means "water now".
+bool holdAllowed() {
+  return screen == SCR_HOME || screen == SCR_WATER;
+}
+
+// Turns a long press into a hold. Also ends a press whose release edge was
+// swallowed as chatter or lost: the pump can never keep running because of it.
+void pollButton() {
+  noInterrupts();
+  bool     pinLow = !((PIND >> PIN_ENC_SW) & 1);
+  uint32_t now    = millis();
+  if (btnDown && !btnHoldFired && pinLow && holdAllowed() &&
+      (now - btnDownMs) >= BTN_HOLD_MS) {
+    btnHoldFired = true;
+    pushEvent(EV_HOLD_START);
+  } else if (btnDown && !pinLow && (now - swLastChange) >= 50) {
+    if (btnHoldFired) {
+      pushEvent(EV_HOLD_END);
+    } else if ((swLastChange - btnDownMs) >= BTN_BOUNCE_MS) {
+      pushEvent(EV_CLICK);             // real press whose release we missed
+      lastClickMs = now;
+    }                                  // else: a noise spike, not a press
+    btnDown = false;
+  }
+  interrupts();
+}
+
+// ---------- Helpers ----------
+void saveSettings() {
+  EEPROM.update(EE_MAGIC_ADDR, EE_MAGIC);
+  EEPROM.update(EE_PLANT_ADDR, selectedPlant);
+  EEPROM.update(EE_AUTO_ADDR, autoWater ? 1 : 0);
+}
+
+void loadSettings() {
+  if (EEPROM.read(EE_MAGIC_ADDR) == EE_MAGIC) {
+    uint8_t p = EEPROM.read(EE_PLANT_ADDR);
+    if (p < PLANT_COUNT) selectedPlant = p;
+    autoWater = (EEPROM.read(EE_AUTO_ADDR) == 1) && USE_REAL_SOIL_SENSOR;
+  }
+  if (EEPROM.read(EE_CAL_MAGIC_ADDR) == EE_CAL_MAGIC) {
+    int d, w;
+    EEPROM.get(EE_CAL_DRY_ADDR, d);
+    EEPROM.get(EE_CAL_WET_ADDR, w);
+    if (abs(d - w) >= SOIL_CAL_MIN_SPAN && d >= 0 && d <= 1023 && w >= 0 && w <= 1023) {
+      soilDry = d;
+      soilWet = w;
+    }
+  }
+  uint8_t sens = EEPROM.read(EE_SENS_ADDR);
+  if (sens < sizeof(SENS_BOOST)) soilSens = sens;
+  uint8_t l = EEPROM.read(EE_LANG_ADDR);
+  if (l < LANG_COUNT) lang = l;
+  uint8_t t = EEPROM.read(EE_TANK_ON_ADDR);
+  if (t <= 1) tankOn = t && USE_TANK_SENSOR;
+  int r;
+  EEPROM.get(EE_TANK_RAW_ADDR, r);
+  if (r >= 20 && r <= 1000) tankEmptyRaw = r;
+}
+
+void saveCalibration() {
+  EEPROM.put(EE_CAL_DRY_ADDR, soilDry);
+  EEPROM.put(EE_CAL_WET_ADDR, soilWet);
+  EEPROM.update(EE_CAL_MAGIC_ADDR, EE_CAL_MAGIC);
+}
+
+uint8_t plantTarget() {
+  return pgm_read_byte(&PLANTS[selectedPlant].target);
+}
+
+// Copies a plant name from flash into buf (at least 17 bytes)
+const char* plantName(uint8_t i, char* buf) {
+  strcpy_P(buf, PLANTS[i].name);
+  return buf;
+}
+
+// Text in the current language. T() returns a flash pointer; tr() copies the
+// text into buf (at least 26 bytes) for functions that need it in RAM.
+const char* T(uint8_t id) {
+  const char* p = TEXT_BLOCKS[lang];
+  while (id--) p += strlen_P(p) + 1;
+  return p;
+}
+
+const char* tr(uint8_t id, char* buf) {
+  strncpy_P(buf, T(id), 25);
+  buf[25] = 0;
+  return buf;
+}
+
+uint8_t moistureStatus() {   // returns a TextId
+  if (!soilOk) return S_ERR;
+  if (soilMoisturePct < plantTarget()) return S_DRY;
+  if (soilMoisturePct > 85) return S_WET;
+  return S_OK;
+}
+
+// "never" / "12m ago" / "acum 12m" / "il y a 12m"
+void formatAgo(char* buf, uint8_t len) {
+  char pre[26], suf[26];
+  if (!wateredOnce) { strncpy_P(buf, T(L_NEVER), len - 1); buf[len - 1] = 0; return; }
+  uint32_t v = (millis() - lastWaterMs) / 1000;
+  char unit = 's';
+  if (v >= 3600)    { v /= 3600; unit = 'h'; }
+  else if (v >= 60) { v /= 60;   unit = 'm'; }
+  snprintf(buf, len, "%s%lu%c%s", tr(AGO_PRE, pre), (unsigned long)v, unit, tr(AGO_SUF, suf));
+}
+
+void moveCursor(uint8_t &cursor, int8_t dir, uint8_t count) {
+  if (dir > 0 && cursor + 1 < count) { cursor++; dirty = true; }
+  if (dir < 0 && cursor > 0)         { cursor--; dirty = true; }
+}
+
+void keepVisible(uint8_t cursor, uint8_t &top) {
+  if (cursor < top) top = cursor;
+  if (cursor >= top + LIST_ROWS) top = cursor - LIST_ROWS + 1;
+}
+
+void goTo(uint8_t s) {   // uint8_t, not Screen: keeps the IDE's auto-prototypes happy
+  screen = (Screen)s;
+  dirty = true;
+  if (s == SCR_MENU)  keepVisible(menuCursor, menuTop);
+  if (s == SCR_WATER) keepVisible(waterCursor, waterTop);
+#if SERIAL_DEBUG
+  Serial.print(F("  -> screen "));
+  Serial.println(s);   // 0 home, 1 menu, 2 plants, 3 soil, 4 environment, 5 watering
+#endif
+}
+
+// ---------- Pump ----------
+void relayOn() {
+  digitalWrite(PIN_RELAY, RELAY_ON);
+  pinMode(PIN_RELAY, OUTPUT);
+}
+
+void relayOff() {
+  if (RELAY_ACTIVE_LOW) {
+    pinMode(PIN_RELAY, INPUT);         // released: module pulls IN up = OFF
+    digitalWrite(PIN_RELAY, LOW);      // (no internal pull-up; LOW is ready for relayOn)
+  } else {
+    digitalWrite(PIN_RELAY, RELAY_OFF);
+    pinMode(PIN_RELAY, OUTPUT);
+  }
+}
+
+void pumpStart(uint8_t mode, uint32_t limitMs, bool isAuto) {
+  if (pumpMode != PUMP_IDLE) return;
+#if PUMP_ENABLED
+  relayOn();
+#endif
+  pumpMode    = mode;
+  pumpIsAuto  = isAuto;
+  pumpStartMs = millis();
+  pumpLimitMs = limitMs;
+  dirty = true;
+#if SERIAL_DEBUG
+  Serial.println(isAuto ? F("PUMP ON (auto)") : F("PUMP ON (manual)"));
+#endif
+}
+
+void pumpStop() {
+  relayOff();
+  if (pumpMode != PUMP_IDLE) {
+    wateredOnce = true;
+    lastWaterMs = millis();
+#if SERIAL_DEBUG
+    Serial.print(F("PUMP OFF after "));
+    Serial.print(millis() - pumpStartMs);
+    Serial.println(F(" ms"));
+#endif
+  }
+  pumpMode = PUMP_IDLE;
+  dirty = true;
+}
+
+// Enforces the time limit of every pump run.
+void updatePump() {
+  if (pumpMode != PUMP_IDLE && millis() - pumpStartMs >= pumpLimitMs) {
+    if (pumpMode == PUMP_HOLD) holdMaxed = true;   // keep the overlay until release
+    pumpStop();
+  }
+}
+
+// True while watering is in progress or the hold that started it is still down
+bool wateringActive() {
+  return pumpMode != PUMP_IDLE || holdActive;
+}
+
+// Called after every soil reading.
+void autoWaterCheck() {
+#if USE_REAL_SOIL_SENSOR
+  if (!autoWater || autoFault || !soilOk || pumpMode != PUMP_IDLE || holdActive) return;
+  if (screen == SCR_CAL) return;       // sensor is out of the soil while calibrating
+  if (tankEmpty) return;               // ~1 cm left: auto watering waits for a refill
+  if (soilMoisturePct >= plantTarget()) { autoPulses = 0; return; }
+  if (wateredOnce && millis() - lastWaterMs < AUTO_SOAK_MS) return;   // let it soak in
+  if (autoPulses >= AUTO_MAX_PULSES) {
+    autoFault = true;                  // tank empty? sensor out of the soil?
+    dirty = true;
+#if SERIAL_DEBUG
+    Serial.println(F("AUTO WATER STOPPED: soil not getting wetter"));
+#endif
+    return;
+  }
+  autoPulses++;
+  pumpStart(PUMP_TIMED, AUTO_PULSE_MS, true);
+#endif
+}
+
+void setAutoWater(bool on) {
+  autoWater  = on;
+  autoFault  = false;                  // turning it on again clears a fault
+  autoPulses = 0;
+  saveSettings();
+  dirty = true;
+#if SERIAL_DEBUG
+  Serial.println(on ? F("Auto water ON") : F("Auto water OFF"));
+#endif
+}
+
+#if USE_REAL_SOIL_SENSOR
+void readSoil();
+#endif
+
+// ---------- Input handling ----------
+void handleTurn(int8_t dir) {
+  switch (screen) {
+    case SCR_HOME: {
+      uint8_t f = (dir > 0) ? FOCUS_MENU : FOCUS_PLANT;   // right = MENU, left = plant
+      if (f != homeFocus) { homeFocus = f; dirty = true; }
+      break;
+    }
+    case SCR_MENU:
+      moveCursor(menuCursor, dir, MENU_COUNT);
+      keepVisible(menuCursor, menuTop);
+      break;
+    case SCR_PLANTS:
+      moveCursor(plantCursor, dir, PLANT_COUNT + 1);
+      keepVisible(plantCursor, plantTop);
+      break;
+    case SCR_WATER:
+      moveCursor(waterCursor, dir, WATER_COUNT);
+      keepVisible(waterCursor, waterTop);
+      break;
+    case SCR_LANG:
+      moveCursor(langCursor, dir, LANG_COUNT + 1);   // + Back
+      break;
+    case SCR_TANK:
+      moveCursor(tankCursor, dir, 4);
+      break;
+    case SCR_SOIL:
+      moveCursor(soilCursor, dir, 2);
+      break;
+    case SCR_CAL:
+      if (calStep <= CAL_WET) {
+        uint8_t c = (dir > 0) ? 1 : 0;   // right = Cancel, left = Save
+        if (c != calChoice) { calChoice = c; dirty = true; }
+      }
+      break;
+    default:
+      break;   // detail screens: only one control (Back), rotation does nothing
+  }
+}
+
+void handleClick() {
+  if (pumpMode == PUMP_TIMED) { pumpStop(); return; }   // click stops a timed run
+
+  switch (screen) {
+    case SCR_HOME:
+      if (homeFocus == FOCUS_MENU) {
+        menuCursor = 0;
+        goTo(SCR_MENU);
+      }
+      break;
+
+    case SCR_MENU:
+      switch (menuCursor) {
+        case MI_PLANT:
+          plantCursor = selectedPlant;
+          plantTop = 0;
+          keepVisible(plantCursor, plantTop);
+          goTo(SCR_PLANTS);
+          break;
+        case MI_SOIL:
+          soilCursor = 0;
+          goTo(SCR_SOIL);
+          break;
+        case MI_WATER:
+          waterCursor = WI_AUTO;
+          waterTop = 0;
+          goTo(SCR_WATER);
+          break;
+        case MI_ENV:   goTo(SCR_ENV);  break;
+        case MI_LANG:
+          langCursor = lang;
+          goTo(SCR_LANG);
+          break;
+        case MI_BACK:
+          homeFocus = FOCUS_MENU;
+          goTo(SCR_HOME);
+          break;
+      }
+      break;
+
+    case SCR_PLANTS:
+      if (plantCursor < PLANT_COUNT) {
+        selectedPlant = plantCursor;
+        autoPulses = 0;
+        saveSettings();
+#if SERIAL_DEBUG
+        Serial.print(F("  plant saved: "));
+        char nm[17];
+        Serial.println(plantName(selectedPlant, nm));
+#endif
+        homeFocus = FOCUS_PLANT;
+        goTo(SCR_HOME);
+      } else {
+        menuCursor = MI_PLANT;
+        goTo(SCR_MENU);
+      }
+      break;
+
+    case SCR_WATER:
+      switch (waterCursor) {
+        case WI_AUTO:
+          if (USE_REAL_SOIL_SENSOR) setAutoWater(!autoWater);   // demo readings: refuse
+          break;
+        case WI_NOW:
+          pumpStart(PUMP_TIMED, MANUAL_PULSE_MS, false);
+          break;
+        case WI_TARGET:
+          break;       // information only
+        case WI_TANK:
+          tankCursor = 0;
+          goTo(SCR_TANK);
+          break;
+        case WI_CAL:
+          calStep = CAL_DRY;
+          calChoice = 0;
+          goTo(SCR_CAL);
+          break;
+        case WI_BACK:
+          menuCursor = MI_WATER;
+          goTo(SCR_MENU);
+          break;
+      }
+      break;
+
+    case SCR_SOIL:
+      if (soilCursor == 1) {                       // cycle Off > Low > Med > High
+        soilSens = (soilSens + 1) % sizeof(SENS_BOOST);
+        EEPROM.update(EE_SENS_ADDR, soilSens);
+#if USE_REAL_SOIL_SENSOR
+        readSoil();                                // show the new % right away
+#endif
+        dirty = true;
+      } else {
+        menuCursor = MI_SOIL;
+        goTo(SCR_MENU);
+      }
+      break;
+    case SCR_ENV:  menuCursor = MI_ENV;  goTo(SCR_MENU); break;
+
+    case SCR_TANK:
+      if (tankCursor == 0 && USE_TANK_SENSOR) {        // sensor on / off
+        tankOn = !tankOn;
+        if (!tankOn) tankEmpty = false;
+        EEPROM.update(EE_TANK_ON_ADDR, tankOn);
+        dirty = true;
+      } else if (tankCursor == 2 && tankOn) {          // current reading = "1 cm left"
+        tankEmptyRaw = tankRaw;
+        tankEmpty = false;
+        EEPROM.put(EE_TANK_RAW_ADDR, tankEmptyRaw);
+        tankSavedMs = millis();
+        dirty = true;
+      } else if (tankCursor == 3) {
+        waterCursor = WI_TANK;
+        goTo(SCR_WATER);
+      }
+      break;
+
+    case SCR_LANG:
+      if (langCursor < LANG_COUNT) {
+        lang = langCursor;
+        EEPROM.update(EE_LANG_ADDR, lang);
+      }
+      menuCursor = MI_LANG;
+      goTo(SCR_MENU);
+      break;
+
+    case SCR_CAL:
+      if (calStep <= CAL_WET && calChoice == 1) {          // Cancel
+        waterCursor = WI_CAL;
+        goTo(SCR_WATER);
+      } else if (calStep == CAL_DRY) {
+        calDryTmp = soilRaw;
+        calStep = CAL_WET;
+        dirty = true;
+      } else if (calStep == CAL_WET) {
+        if (soilOk && abs(calDryTmp - soilRaw) >= SOIL_CAL_MIN_SPAN) {
+          soilDry = calDryTmp;
+          soilWet = soilRaw;
+          saveCalibration();
+          autoPulses = 0;
+          calStep = CAL_DONE;
+#if SERIAL_DEBUG
+          Serial.print(F("Calibration saved: dry "));
+          Serial.print(soilDry);
+          Serial.print(F(" wet "));
+          Serial.println(soilWet);
+#endif
+        } else {
+          calStep = CAL_FAIL;
+        }
+        dirty = true;
+      } else if (calStep == CAL_DONE) {
+        waterCursor = WI_CAL;
+        goTo(SCR_WATER);
+      } else {                                              // CAL_FAIL: try again
+        calStep = CAL_DRY;
+        calChoice = 0;
+        dirty = true;
+      }
+      break;
+  }
+}
+
+void handleHoldStart() {
+  if (pumpMode != PUMP_IDLE) return;   // manual watering works even with an empty tank (override)
+  holdActive = true;
+  holdMaxed  = false;
+  pumpStart(PUMP_HOLD, MANUAL_MAX_MS, false);
+}
+
+void handleHoldEnd() {
+  if (pumpMode == PUMP_HOLD) pumpStop();
+  holdActive = false;
+  holdMaxed  = false;
+  dirty = true;
+}
+
+// ---------- Drawing ----------
+// Draws text stored in flash (PSTR). On an Uno, plain "text" literals live in
+// RAM, so on-screen text goes through this to leave room for the stack.
+uint8_t drawStrP(uint8_t x, uint8_t y, const char* p) {
+  char buf[26];
+  strncpy_P(buf, p, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = 0;
+  return oled.drawStr(x, y, buf);
+}
+
+void drawBar(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t pct) {
+  oled.drawRFrame(x, y, w, h, 2);
+  uint8_t fill = (uint16_t)(w - 4) * pct / 100;
+  if (fill) oled.drawBox(x + 2, y + 2, fill, h - 4);
+}
+
+// Small target marker under a bar, at pct of its width
+void drawBarMarker(uint8_t x, uint8_t y, uint8_t w, uint8_t pct) {
+  uint8_t mx = x + 2 + (uint16_t)(w - 4) * pct / 100;
+  oled.drawTriangle(mx - 2, y + 3, mx + 2, y + 3, mx, y);
+}
+
+void drawTitle(uint8_t textId, bool demo) {
+  oled.setFont(FONT_MAIN);
+  drawStrP(2, 0, T(textId));
+  if (demo) {
+    oled.setFont(FONT_SMALL);
+    drawStrP(107, 1, T(T_DEMO));
+  }
+  oled.drawHLine(0, 10, 128);
+}
+
+// One list row. Rows are 0..121 wide; x 122..127 is kept free for scroll arrows.
+void drawListRow(uint8_t row, const char* text, bool highlighted, const char* right) {
+  uint8_t y = LIST_Y0 + row * LIST_ROW_H;
+  oled.setFont(FONT_MAIN);
+  if (highlighted) {
+    oled.drawRFrame(0, y, 122, LIST_ROW_H, 3);
+    oled.drawStr(3, y + 2, ">");
+  }
+  oled.drawStr(11, y + 2, text);
+  if (right) oled.drawStr(117 - oled.getStrWidth(right), y + 2, right);
+}
+
+void drawScrollArrows(uint8_t top, uint8_t count) {
+  if (top > 0)                                   // more above
+    oled.drawTriangle(124, 13, 122, 17, 127, 17);
+  if (top + LIST_ROWS < count)                   // more below
+    oled.drawTriangle(122, 58, 127, 58, 124, 62);
+}
+
+// label (TextId) on the left, value right-aligned
+void drawValueRow(uint8_t y, uint8_t labelId, const char* value) {
+  oled.setFont(FONT_MAIN);
+  drawStrP(2, y, T(labelId));
+  oled.drawStr(126 - oled.getStrWidth(value), y, value);
+}
+
+// Draws e.g. "21°C" (num = "21") starting at x in the current font, returns the end x
+uint8_t drawTemp(uint8_t x, uint8_t y, const char* num) {
+  uint8_t w = oled.getStrWidth(num);
+  oled.drawStr(x, y, num);
+  if (!airOk) return x + w;                 // "--": no unit
+  oled.drawCircle(x + w + 2, y + 1, 1);
+  return x + w + 5 + oled.drawStr(x + w + 5, y, "C");
+}
+
+// Air values as text: whole numbers for Home, one decimal for the detail screen
+void formatAir(char* t, char* h, uint8_t len, bool decimals) {
+  if (!airOk) { snprintf(t, len, "--"); snprintf(h, len, "--"); return; }
+  if (decimals) {
+    int16_t a = abs(airTemp10);
+    snprintf(t, len, "%s%d.%d", airTemp10 < 0 ? "-" : "", a / 10, a % 10);
+    snprintf(h, len, "%u.%u", airHum10 / 10, airHum10 % 10);
+  } else {
+    snprintf(t, len, "%d", (airTemp10 + (airTemp10 >= 0 ? 5 : -5)) / 10);
+    snprintf(h, len, "%u", (airHum10 + 5) / 10);
+  }
+}
+
+void drawBackButton() {
+  char buf[26];
+  oled.setFont(FONT_MAIN);
+  uint8_t w = oled.getStrWidth(tr(B_BACK, buf));
+  oled.drawRFrame(0, 52, w + 10, 12, 3);
+  oled.drawStr(5, 54, buf);
+}
+
+// Two small buttons at the bottom; the selected one is filled
+void drawButton(uint8_t x, uint8_t w, const char* label, bool selected) {
+  oled.setFont(FONT_MAIN);
+  if (selected) {
+    oled.drawRBox(x, 51, w, 13, 3);
+    oled.setDrawColor(0);
+  } else {
+    oled.drawRFrame(x, 51, w, 13, 3);
+  }
+  oled.drawStr(x + (w - oled.getStrWidth(label)) / 2, 53, label);
+  oled.setDrawColor(1);
+}
+
+void drawButtonT(uint8_t x, uint8_t w, uint8_t textId, bool selected) {
+  char buf[26];
+  drawButton(x, w, tr(textId, buf), selected);
+}
+
+// Small-font text ending at x = 127
+void drawRightP(uint8_t y, const char* p) {
+  char buf[26];
+  strncpy_P(buf, p, 25);
+  buf[25] = 0;
+  oled.drawStr(127 - oled.getStrWidth(buf), y, buf);
+}
+
+void drawHome() {
+  char buf[16];
+
+  // --- header: plant icon + name ---
+  oled.drawXBMP(2, 1, 16, 16, ICON_PLANT);
+  oled.setFont(FONT_MAIN);
+  char nm[17];
+  uint8_t nw = oled.drawStr(22, 5, plantName(selectedPlant, nm));
+  if (homeFocus == FOCUS_PLANT) oled.drawHLine(22, 15, nw);
+
+  // --- moisture: drop + big number + status ---
+  oled.drawXBMP(3, 24, 7, 11, ICON_DROP);
+  oled.setFont(FONT_BIG);
+  snprintf(buf, sizeof(buf), "%u", soilMoisturePct);
+  uint8_t x = 14 + oled.drawStr(14, 21, buf);
+  oled.setFont(FONT_MAIN);
+  oled.drawStr(x + 1, 27, "%");
+
+  drawStrP(52, 21, T(moistureStatus()));
+  oled.setFont(FONT_SMALL);
+  snprintf_P(buf, sizeof(buf), T(F_MIN), plantTarget());
+  oled.drawStr(52, 31, buf);
+
+  // --- moisture bar with the plant's target marked ---
+  drawBar(2, 40, 86, 7, soilMoisturePct);
+  drawBarMarker(2, 48, 86, plantTarget());
+
+  // --- MENU button (right) ---
+  oled.setFont(FONT_SMALL);
+  if (homeFocus == FOCUS_MENU) {
+    oled.drawRBox(93, 17, 35, 17, 3);
+    oled.setDrawColor(0);
+  } else {
+    oled.drawRFrame(93, 17, 35, 17, 3);
+  }
+  drawStrP(96, 22, T(H_MENU));
+  oled.setDrawColor(1);
+
+  // --- status bar ---
+  oled.drawHLine(0, 53, 128);
+  oled.drawXBMP(2, 55, 5, 9, ICON_THERMO);
+  char hum[8];
+  formatAir(buf, hum, 8, false);
+  uint8_t ex = drawTemp(9, 56, buf);
+  snprintf(buf, sizeof(buf), "%s%%RH", hum);
+  oled.drawStr(ex + 6, 56, buf);
+
+  if (tankOn && tankEmpty)  drawRightP(56, T(H_REFILL));
+  else if (autoFault)       drawRightP(56, T(H_FAULT));
+  else if (!soilOk)         drawRightP(56, T(H_NOSENSOR));
+  else if (autoWater) {
+    oled.drawRBox(96, 55, 31, 9, 2);
+    oled.setDrawColor(0);
+    drawStrP(102, 56, T(H_AUTO));
+    oled.setDrawColor(1);
+  } else                    drawRightP(56, T(H_HOLD));
+}
+
+void drawMenu() {
+  char buf[26];
+  drawTitle(T_MENU, false);
+  for (uint8_t r = 0; r < LIST_ROWS; r++) {
+    uint8_t i = menuTop + r;
+    if (i >= MENU_COUNT) break;
+    drawListRow(r, tr(MENU_TEXT[i], buf), i == menuCursor, i == MI_BACK ? nullptr : ">");
+  }
+  drawScrollArrows(menuTop, MENU_COUNT);
+}
+
+void drawPlants() {
+  drawTitle(T_PLANTS, false);
+  for (uint8_t r = 0; r < LIST_ROWS; r++) {
+    uint8_t i = plantTop + r;
+    if (i > PLANT_COUNT) break;
+    char nm[26];
+    const char* text  = (i < PLANT_COUNT) ? plantName(i, nm) : tr(M_BACK, nm);
+    const char* right = (i == selectedPlant) ? "*" : nullptr;   // current plant
+    drawListRow(r, text, i == plantCursor, right);
+  }
+  drawScrollArrows(plantTop, PLANT_COUNT + 1);
+}
+
+void drawLanguage() {
+  char buf[26];
+  drawTitle(T_LANG, false);
+  for (uint8_t i = 0; i < LANG_COUNT; i++)
+    drawListRow(i, LANG_NAMES[i], i == langCursor, i == lang ? "*" : nullptr);
+  drawListRow(LANG_COUNT, tr(M_BACK, buf), langCursor == LANG_COUNT, nullptr);
+}
+
+void drawSoil() {
+  char buf[26], st[26];
+  drawTitle(T_SOIL, !USE_REAL_SOIL_SENSOR);
+  snprintf(buf, sizeof(buf), "%u%% %s", soilMoisturePct, tr(moistureStatus(), st));
+  drawValueRow(12, L_MOIST, buf);
+  snprintf(buf, sizeof(buf), "%u%%", plantTarget());
+  drawValueRow(22, W_BELOW, buf);
+  formatAgo(buf, sizeof(buf));
+  drawValueRow(32, L_WATERED, buf);
+  oled.setFont(FONT_SMALL);
+  snprintf_P(buf, sizeof(buf), T(F_RAW), soilRaw);
+  oled.drawStr(2, 42, buf);
+  snprintf_P(buf, sizeof(buf), T(F_CAL), soilDry, soilWet);
+  oled.drawStr(126 - oled.getStrWidth(buf), 42, buf);
+  drawButtonT(0, 52, B_BACK, soilCursor == 0);
+  snprintf_P(buf, sizeof(buf), T(F_SENS), tr(SENS_OFF + soilSens, st));
+  drawButton(56, 72, buf, soilCursor == 1);
+}
+
+void drawEnvironment() {
+  char buf[26];
+  char t[8], h[8];
+  drawTitle(T_ENV, !USE_DHT_SENSOR);
+  formatAir(t, h, sizeof(t), true);
+  oled.setFont(FONT_MAIN);
+  drawStrP(2, 13, T(L_TEMP));
+  uint8_t w = oled.getStrWidth(t) + (airOk ? 11 : 0);   // number + "°C"
+  drawTemp(126 - w, 13, t);
+  snprintf(buf, sizeof(buf), "%s%%", h);
+  drawValueRow(23, L_HUM, airOk ? buf : h);
+  if (!USE_DHT_SENSOR)  tr(V_NONE, buf);
+  else if (!dhtType)    tr(C_NOSIGNAL, buf);
+  else                  snprintf(buf, sizeof(buf), "DHT%u%s", dhtType, airOk ? "" : " ?");
+  drawValueRow(33, L_SENSOR, buf);
+  if (!USE_DHT_SENSOR) {
+    oled.setFont(FONT_SMALL);
+    drawStrP(2, 43, T(L_SIMULATED));
+  }
+  drawBackButton();
+}
+
+void drawCalibrate() {
+  char buf[26];
+  if (calStep == CAL_DRY || calStep == CAL_WET) {
+    drawTitle(calStep == CAL_DRY ? T_CAL1 : T_CAL2, false);
+    oled.setFont(FONT_MAIN);
+    drawStrP(2, 14, T(calStep == CAL_DRY ? C_DRY_AIR : C_IN_WATER));
+    if (soilOk) snprintf(buf, sizeof(buf), "%d", soilRaw);
+    else        tr(C_NOSIGNAL, buf);
+    drawValueRow(26, C_READING, buf);
+    oled.setFont(FONT_SMALL);
+    if (calStep == CAL_DRY) drawStrP(2, 39, T(C_WAIT));
+    else {
+      snprintf_P(buf, sizeof(buf), T(F_DRYSAVED), calDryTmp);
+      oled.drawStr(2, 39, buf);
+    }
+    drawButtonT(0, 56, calStep == CAL_DRY ? B_NEXT : B_SAVE, calChoice == 0);
+    drawButtonT(64, 64, B_CANCEL, calChoice == 1);
+  } else if (calStep == CAL_DONE) {
+    drawTitle(T_CAL_DONE, false);
+    oled.setFont(FONT_MAIN);
+    drawStrP(2, 14, T(C_SAVED));
+    snprintf(buf, sizeof(buf), "%d", soilDry);
+    drawValueRow(26, C_DRY, buf);
+    snprintf(buf, sizeof(buf), "%d", soilWet);
+    drawValueRow(37, C_WET, buf);
+    drawButtonT(0, 64, B_OK, true);
+  } else {
+    drawTitle(T_CAL, false);
+    oled.setFont(FONT_MAIN);
+    drawStrP(2, 14, T(C_NOTSAVED));
+    oled.setFont(FONT_SMALL);
+    drawStrP(2, 27, T(C_FAIL1));
+    drawStrP(2, 36, T(C_FAIL2));
+    drawButtonT(0, 64, B_RETRY, true);
+  }
+}
+
+// "71%", "EMPTY" or "Off" for the tank
+const char* tankLevelText(char* buf) {
+  if (!tankOn)    return tr(V_OFF, buf);
+  if (tankEmpty)  return tr(V_EMPTY, buf);
+  snprintf(buf, 26, "%ld%%", constrain(map(tankRaw, tankEmptyRaw, TANK_FULL_RAW, 0, 100), 0L, 100L));
+  return buf;
+}
+
+void drawTank() {
+  char label[26], val[26];
+  drawTitle(T_TANK, false);
+  drawListRow(0, tr(L_SENSOR, label), tankCursor == 0, tr(tankOn ? V_ON : V_OFF, val));
+  drawListRow(1, tr(TK_LEVEL, label), tankCursor == 1, tankLevelText(val));
+  if (!tankOn)                            tr(V_NA, val);
+  else if (millis() - tankSavedMs < 1500 && tankSavedMs) tr(B_OK, val);
+  else                                    snprintf(val, sizeof(val), "%d", tankRaw);   // live reading
+  drawListRow(2, tr(TK_SET, label), tankCursor == 2, val);
+  drawListRow(3, tr(M_BACK, label), tankCursor == 3, nullptr);
+}
+
+void drawWatering() {
+  char label[26], val[26];
+  drawTitle(T_WATER, false);
+  for (uint8_t r = 0; r < LIST_ROWS; r++) {
+    uint8_t i = waterTop + r;
+    if (i >= WATER_COUNT) break;
+    const char* right = nullptr;
+    uint8_t labelId = M_BACK;
+    switch (i) {
+      case WI_AUTO:
+        labelId = W_AUTO;
+        right = tr(!USE_REAL_SOIL_SENSOR ? V_NA : autoFault ? V_CHECK : autoWater ? V_ON : V_OFF, val);
+        break;
+      case WI_NOW:
+        labelId = W_NOW;
+        right = PUMP_ENABLED ? "3s" : tr(V_LOCKED, val);
+        break;
+      case WI_TARGET:
+        labelId = W_BELOW;
+        snprintf(val, sizeof(val), "%u%%", plantTarget());
+        right = val;
+        break;
+      case WI_TANK:
+        labelId = W_TANK;
+        right = tankLevelText(val);
+        break;
+      case WI_CAL:
+        labelId = W_CAL;
+        right = ">";
+        break;
+    }
+    drawListRow(r, tr(labelId, label), i == waterCursor, right);
+  }
+  drawScrollArrows(waterTop, WATER_COUNT);
+}
+
+void initDisplay() {
+  oled.setBusClock(100000);  // 100 kHz: more noise margin on long jumper wires
+  oled.begin();
+  oled.setFontPosTop();
+  oled.setFontMode(1);       // transparent text, needed for inverted text
+  oled.setBitmapMode(1);     // transparent icons
+  Wire.setWireTimeout(5000, true);   // 5 ms; abort + reset TWI instead of hanging
+}
+
+// Re-sends the display's layout settings (same values U8g2 uses at init)
+// without blanking the screen. A corrupted I2C byte can be taken as a command
+// and shift the picture (start line, offset, mirroring); this puts it back.
+void refreshDisplayConfig() {
+#if DISPLAY_SSD1309
+  oled.sendF("cacacacacccacaccc",
+             0xD5, 0xA0,     // clock divide / oscillator
+             0xA8, 0x3F,     // multiplex ratio 64
+             0xD3, 0x00,     // display offset 0
+             0x20, 0x02,     // page addressing mode (what U8g2's SSD1309 driver expects)
+             0x40,           // start line 0
+             0xA1,           // segment remap
+             0xC8,           // COM scan direction
+             0xDA, 0x12,     // COM pin config
+             0x81, 0x6F,     // contrast
+             0xA4,           // show RAM contents
+             0xA6,           // normal (not inverted)
+             0xAF);          // display ON (in case the OLED reset itself)
+#else
+  oled.sendF("cacacaccccacaccc",
+             0xD5, 0x80,     // clock divide / oscillator
+             0xA8, 0x3F,     // multiplex ratio 64
+             0xD3, 0x00,     // display offset 0
+             0x40,           // start line 0
+             0xA1,           // segment remap
+             0xC8,           // COM scan direction
+             0xDA, 0x12,     // COM pin config
+             0x81, 0xCF,     // contrast
+             0xA4,           // show RAM contents
+             0xA6,           // normal (not inverted)
+             0xAF);          // display ON (in case the OLED reset itself)
+#endif
+}
+
+void drawScreen() {
+  oled.firstPage();
+  do {
+    if (wateringActive()) {
+      drawWateringScene();
+      continue;
+    }
+    switch (screen) {
+      case SCR_HOME:   drawHome();        break;
+      case SCR_MENU:   drawMenu();        break;
+      case SCR_PLANTS: drawPlants();      break;
+      case SCR_SOIL:   drawSoil();        break;
+      case SCR_ENV:    drawEnvironment(); break;
+      case SCR_WATER:  drawWatering();    break;
+      case SCR_CAL:    drawCalibrate();   break;
+      case SCR_LANG:   drawLanguage();    break;
+      case SCR_TANK:   drawTank();        break;
+    }
+  } while (oled.nextPage());
+}
+
+// Draws the current screen. If any I2C transfer failed, the picture may be
+// scrambled, so the display settings are re-sent and the frame drawn again.
+void render(bool periodic) {
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    Wire.clearWireTimeoutFlag();
+    i2cError = false;
+    if (periodic || attempt > 0) refreshDisplayConfig();
+    drawScreen();
+
+    if (Wire.getWireTimeoutFlag()) {   // bus hung; Wire has already reset the I2C hardware
+#if SERIAL_DEBUG
+      Serial.println(F("I2C timeout"));
+#endif
+      i2cError = true;                 // next attempt re-sends the settings
+    }
+    if (!i2cError) break;
+    i2cErrorCount++;
+#if SERIAL_DEBUG
+    Serial.print(F("I2C error, redrawing (total errors: "));
+    Serial.print(i2cErrorCount);
+    Serial.println(F(")"));
+#endif
+  }
+}
+
+// ---------- Plant scene (startup animation + watering screen) ----------
+constexpr uint8_t INTRO_FRAMES = 26;
+constexpr uint8_t CAN_X        = 26;   // watering can position once it is in place
+
+void drawPot() {
+  oled.drawRBox(50, 44, 28, 4, 1);                 // rim
+  oled.drawBox(53, 48, 22, 14);                    // body
+  oled.drawTriangle(51, 48, 53, 48, 53, 61);       // tapered sides
+  oled.drawTriangle(77, 48, 75, 48, 75, 61);
+}
+
+// h = stem height in pixels, 0..24 (24 = fully grown)
+void drawPlant(int8_t h) {
+  if (h > 0) oled.drawVLine(64, 44 - h, h);
+  if (h >= 6)  oled.drawFilledEllipse(59, 39, 4, 2);
+  if (h >= 11) oled.drawFilledEllipse(69, 34, 4, 2);
+  if (h >= 16) oled.drawFilledEllipse(59, 29, 4, 2);
+  if (h >= 21) oled.drawFilledEllipse(69, 24, 4, 2);
+  if (h >= 24) oled.drawDisc(64, 19, 2);
+}
+
+void drawCan(uint8_t cx) {
+  oled.drawRFrame(cx - 6, 22, 10, 12, 4);          // handle
+  oled.drawRBox(cx, 24, 18, 13, 2);                // body
+  oled.drawLine(cx + 17, 33, cx + 27, 25);         // spout (2 px thick)
+  oled.drawLine(cx + 17, 34, cx + 27, 26);
+  oled.drawBox(cx + 26, 23, 4, 4);                 // sprinkler head
+}
+
+// three drops falling from the sprinkler to the pot; phase advances the animation
+void drawDrops(uint8_t cx, uint8_t phase) {
+  for (uint8_t k = 0; k < 3; k++) {
+    uint8_t y = 29 + (phase * 3 + k * 5) % 14;
+    oled.drawPixel(cx + 28, y);
+    oled.drawBox(cx + 27, y + 1, 3, 2);
+  }
+}
+
+// Startup: the can slides in and pours while the plant grows. ~3 seconds.
+void drawIntroFrame(uint8_t f) {
+  oled.setFont(FONT_MAIN);
+  drawStrP(25, 1, PSTR("Smart Planter"));
+  drawPot();
+  drawPlant(constrain((int8_t)(f - 7) * 2, 0, 24));
+  uint8_t cx = (f < 5) ? 6 + f * 5 : CAN_X;
+  drawCan(cx);
+  if (f >= 5 && f <= 20) drawDrops(cx, f);
+  if (f >= 22 && (f & 1)) {                        // sparkle when fully grown
+    oled.drawHLine(70, 17, 5);
+    oled.drawVLine(72, 15, 5);
+  }
+}
+
+// Shown full-screen while the pump runs: the same scene, pouring, with the time.
+void drawWateringScene() {
+  char buf[8];
+  oled.setFont(FONT_MAIN);
+  drawStrP(2, 1, T(pumpIsAuto && pumpMode != PUMP_IDLE ? SC_AUTO : SC_WATERING));
+  oled.drawHLine(0, 11, 128);
+
+  drawPot();
+  drawPlant(24);
+  drawCan(CAN_X);
+  if (pumpMode != PUMP_IDLE) drawDrops(CAN_X, millis() / 100);
+
+  // seconds watered so far, big, on the right
+  uint32_t elapsed = (pumpMode != PUMP_IDLE) ? millis() - pumpStartMs : pumpLimitMs;
+  oled.setFont(FONT_BIG);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)(elapsed / 1000));
+  uint8_t w = oled.getStrWidth(buf);
+  oled.drawStr(110 - w, 22, buf);
+  oled.setFont(FONT_MAIN);
+  oled.drawStr(112, 28, "s");
+
+  oled.setFont(FONT_SMALL);
+  drawRightP(46, T(!PUMP_ENABLED         ? V_LOCKED
+                   : holdMaxed             ? SC_MAX
+                   : pumpMode == PUMP_HOLD ? SC_LETGO
+                   :                         SC_TAPSTOP));
+  snprintf(buf, sizeof(buf), "/%lus", (unsigned long)(pumpLimitMs / 1000));
+  oled.drawStr(127 - oled.getStrWidth(buf), 55, buf);
+}
+
+void playIntro() {
+  for (uint8_t f = 0; f < INTRO_FRAMES; f++) {
+    oled.firstPage();
+    do { drawIntroFrame(f); } while (oled.nextPage());
+    delay(20);
+  }
+  delay(400);
+}
+
+// ---------- Air sensor (DHT11 / DHT22) ----------
+#if USE_DHT_SENSOR
+uint8_t dhtStartMs = 20;     // start pulse: DHT11 needs ~18 ms; switches to 2 ms if that fails
+uint8_t dhtFails   = 0;
+
+// Waits while the pin stays at `level`; returns loop count, 0 on timeout.
+uint16_t dhtPulse(uint8_t level) {
+  const uint8_t bit = digitalPinToBitMask(PIN_DHT);
+  volatile uint8_t* in = portInputRegister(digitalPinToPort(PIN_DHT));
+  const uint8_t want = level ? bit : 0;
+  uint16_t n = 0;
+  while ((*in & bit) == want) {
+    if (++n >= 2000) return 0;
+  }
+  return n;
+}
+
+// One reading. Interrupts are off for ~5 ms while the 40 data bits arrive.
+bool readDHT() {
+  uint8_t d[5] = { 0, 0, 0, 0, 0 };
+  pinMode(PIN_DHT, OUTPUT);
+  digitalWrite(PIN_DHT, LOW);
+  delay(dhtStartMs);
+  pinMode(PIN_DHT, INPUT_PULLUP);
+  delayMicroseconds(10);
+
+  bool ok = true;
+  noInterrupts();
+  dhtPulse(HIGH);                                        // line released; sensor answers within ~40 us
+  if (!dhtPulse(LOW) || !dhtPulse(HIGH)) ok = false;    // sensor's 80 us low + 80 us high "I'm here"
+  for (uint8_t i = 0; ok && i < 40; i++) {
+    uint16_t lo = dhtPulse(LOW);
+    uint16_t hi = dhtPulse(HIGH);
+    if (!lo || !hi) { ok = false; break; }
+    d[i / 8] <<= 1;
+    if (hi > lo) d[i / 8] |= 1;      // long high pulse = 1, short = 0
+  }
+  interrupts();
+  if (!ok || (uint8_t)(d[0] + d[1] + d[2] + d[3]) != d[4]) return false;
+
+  int16_t t10;
+  uint16_t h10;
+  if (d[0] <= 3) {                   // DHT22: 16-bit values in tenths
+    dhtType = 22;
+    h10 = ((uint16_t)d[0] << 8) | d[1];
+    t10 = ((int16_t)(d[2] & 0x7F) << 8) | d[3];
+    if (d[2] & 0x80) t10 = -t10;
+  } else {                           // DHT11: whole numbers (+ optional decimal byte)
+    dhtType = 11;
+    h10 = d[0] * 10 + (d[1] < 10 ? d[1] : 0);
+    t10 = d[2] * 10 + (d[3] & 0x0F);
+    if (d[3] & 0x80) t10 = -t10;
+  }
+  if (h10 > 1000 || t10 < -400 || t10 > 800) return false;
+  airTemp10 = t10;
+  airHum10  = h10;
+  return true;
+}
+
+void updateAir() {
+  bool was = airOk;
+  int16_t oldT = airTemp10;
+  uint16_t oldH = airHum10;
+  if (readDHT()) {
+    dhtFails = 0;
+    airOk = true;
+  } else if (++dhtFails >= 3) {
+    airOk = false;                    // keep showing old values for a couple of misses
+    dhtStartMs = (dhtStartMs == 20) ? 2 : 20;   // try the other start pulse length
+    dhtFails = 0;
+  }
+  if ((airOk != was || airTemp10 != oldT || airHum10 != oldH) &&
+      (screen == SCR_HOME || screen == SCR_ENV)) dirty = true;
+}
+#endif
+
+// ---------- Water tank sensor ----------
+#if USE_TANK_SENSOR
+void readTank() {
+  digitalWrite(PIN_TANK_PWR, HIGH);
+  delay(10);
+  int sum = 0;
+  for (uint8_t i = 0; i < 4; i++) sum += analogRead(PIN_TANK_ADC);
+  digitalWrite(PIN_TANK_PWR, LOW);
+  int raw = sum / 4;
+
+  bool empty = tankEmpty ? (raw < tankEmptyRaw + TANK_HYST) : (raw < tankEmptyRaw);   // hysteresis
+  if (empty && !tankEmpty && pumpIsAuto && pumpMode != PUMP_IDLE) {
+    pumpStop();                                 // auto run reached ~1 cm left: stop (manual runs continue)
+#if SERIAL_DEBUG
+    Serial.println(F("TANK EMPTY"));
+#endif
+  }
+  if (empty != tankEmpty || abs(raw - tankRaw) > 10) dirty = true;
+  tankEmpty = empty;
+  tankRaw = raw;
+}
+#endif
+
+// ---------- Soil sensor ----------
+#if USE_REAL_SOIL_SENSOR
+void readSoil() {
+  digitalWrite(PIN_SOIL_PWR, HIGH);
+  delay(20);                              // let sensor settle (input still handled by ISR)
+  int sum = 0;
+  for (uint8_t i = 0; i < 4; i++) sum += analogRead(PIN_SOIL_ADC);
+  digitalWrite(PIN_SOIL_PWR, LOW);        // power off between readings to reduce corrosion
+  int raw = sum / 4;
+
+  bool ok = raw > 50 && raw < 1020;       // 0 or 1023 = wire loose / sensor unplugged
+  long pct = map(raw, soilDry, soilWet, 0, 100);
+  pct = constrain(pct, 0, 100);
+  pct += pct * (100 - pct) * SENS_BOOST[soilSens] / 10000;   // sensitivity boost
+  if ((uint8_t)pct != soilMoisturePct || ok != soilOk || raw != soilRaw) {
+    if (screen == SCR_HOME || screen == SCR_SOIL || screen == SCR_WATER || screen == SCR_CAL) dirty = true;
+  }
+  soilRaw = raw;
+  soilOk = ok;
+  soilMoisturePct = pct;
+}
+#endif
+
+// ---------- Setup / loop ----------
+void setup() {
+  wdt_disable();
+
+  // Relay first, so the pump is off as early as possible.
+  relayOff();
+
+  pinMode(PIN_SOIL_PWR, OUTPUT);
+  digitalWrite(PIN_SOIL_PWR, LOW);
+  pinMode(PIN_TANK_PWR, OUTPUT);
+  digitalWrite(PIN_TANK_PWR, LOW);
+
+#if SERIAL_DEBUG
+  Serial.begin(115200);
+  Serial.println(F("Smart Planter start"));
+  Serial.print(F("CLK=D")); Serial.print(PIN_ENC_CLK);
+  Serial.print(F(" DT=D"));  Serial.print(PIN_ENC_DT);
+  Serial.print(F(" SW=D"));  Serial.println(PIN_ENC_SW);
+#endif
+
+  loadSettings();
+
+  initDisplay();
+  playIntro();
+
+  setupEncoder();            // enable input only after the splash
+
+#if USE_REAL_SOIL_SENSOR
+  readSoil();
+#endif
+  dirty = true;
+  wdt_enable(WDTO_2S);       // last resort: reboot if the loop ever stalls (relay OFF after reset)
+}
+
+void loop() {
+  wdt_reset();
+  pollButton();
+
+  uint8_t ev;
+  while (popEvent(ev)) {
+#if SERIAL_DEBUG
+    switch (ev) {
+      case EV_RIGHT:      Serial.println(F("RIGHT"));   break;
+      case EV_LEFT:       Serial.println(F("LEFT"));    break;
+      case EV_CLICK:      Serial.println(F("CLICK"));   break;
+      case EV_HOLD_START: Serial.println(F("HOLD"));    break;
+      case EV_HOLD_END:   Serial.println(F("RELEASE")); break;
+    }
+#endif
+    switch (ev) {
+      case EV_RIGHT:      handleTurn(+1);    break;
+      case EV_LEFT:       handleTurn(-1);    break;
+      case EV_CLICK:      handleClick();     break;
+      case EV_HOLD_START: handleHoldStart(); break;
+      case EV_HOLD_END:   handleHoldEnd();   break;
+    }
+  }
+
+  updatePump();
+
+#if USE_REAL_SOIL_SENSOR
+  static uint32_t lastSoilReadMs = 0;
+  if (millis() - lastSoilReadMs >= (screen == SCR_CAL ? 300 : SOIL_READ_MS)) {   // live while calibrating
+    lastSoilReadMs = millis();
+    readSoil();
+    autoWaterCheck();
+  }
+#endif
+
+#if USE_TANK_SENSOR
+  static uint32_t lastTankReadMs = 0;
+  if (tankOn && millis() - lastTankReadMs >= (pumpMode != PUMP_IDLE || screen == SCR_TANK ? 500 : 5000)) {
+    lastTankReadMs = millis();               // fast while pumping or on the Tank screen
+    readTank();
+  }
+#endif
+
+#if USE_DHT_SENSOR
+  static uint32_t lastAirReadMs = 0;
+  if (millis() - lastAirReadMs >= 3000 && !wateringActive()) {   // DHT22 needs >= 2 s between reads
+    lastAirReadMs = millis();
+    updateAir();
+  }
+#endif
+
+  static uint32_t lastRenderMs = 0;
+  uint16_t interval = wateringActive() ? 120 : DISPLAY_REFRESH_MS;   // animate while watering
+  if (dirty) {
+    dirty = false;
+    render(false);
+    lastRenderMs = millis();
+  } else if (millis() - lastRenderMs >= interval) {
+    render(!wateringActive());
+    lastRenderMs = millis();
+  }
+}
